@@ -53,3 +53,4 @@ vcpkg_installed/
 # backup files
 *~
 *.orig
+python/examples/vocab_tree_faiss_flickr100K_words256K.bin

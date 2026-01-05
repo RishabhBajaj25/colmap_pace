@@ -9,11 +9,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import Literal, TypeVar, cast
 
 import cv2
 import numpy as np
-import numpy.typing as npt
 import PIL.ExifTags
 import PIL.Image
 from scipy.spatial.transform import Rotation
@@ -22,9 +20,7 @@ from tqdm import tqdm
 import pycolmap
 from pycolmap import logging
 
-N = TypeVar("N", bound=int)
-NDArrayNx2 = np.ndarray[tuple[N, Literal[2]], np.dtype[np.float64]]
-NDArray3x1 = np.ndarray[tuple[Literal[3], Literal[1]], np.dtype[np.float64]]
+import shutil
 
 
 @dataclass
@@ -37,8 +33,10 @@ class PanoRenderOptions:
 
 PANO_RENDER_OPTIONS: dict[str, PanoRenderOptions] = {
     "overlapping": PanoRenderOptions(
-        num_steps_yaw=4,
-        pitches_deg=(-35.0, 0.0, 35.0),
+        num_steps_yaw=24,
+        # num_steps_yaw=2,
+
+        pitches_deg=(0.0, -30.0, +30.0,),
         hfov_deg=90.0,
         vfov_deg=90.0,
     ),
@@ -63,31 +61,23 @@ def create_virtual_camera(
     image_height = int(pano_height * vfov_deg / 180)
     focal = image_width / (2 * np.tan(np.deg2rad(hfov_deg) / 2))
     return pycolmap.Camera.create(
-        0,
-        pycolmap.CameraModelId.SIMPLE_PINHOLE,
-        focal,
-        image_width,
-        image_height,
+        0, "SIMPLE_PINHOLE", focal, image_width, image_height
     )
 
 
-def get_virtual_camera_rays(
-    camera: pycolmap.Camera,
-) -> npt.NDArray[np.floating]:
+def get_virtual_camera_rays(camera: pycolmap.Camera) -> np.ndarray:
     size = (camera.width, camera.height)
     x, y = np.indices(size).astype(np.float32)
-    xy: NDArrayNx2 = np.column_stack([x.ravel(), y.ravel()])
+    xy = np.column_stack([x.ravel(), y.ravel()])
     # The center of the upper left most pixel has coordinate (0.5, 0.5)
     xy += 0.5
-    xy_norm: NDArrayNx2 = camera.cam_from_img(image_points=xy)
+    xy_norm = camera.cam_from_img(xy)
     rays = np.concatenate([xy_norm, np.ones_like(xy_norm[:, :1])], -1)
     rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
     return rays
 
 
-def spherical_img_from_cam(
-    image_size: tuple[int, int], rays_in_cam: npt.NDArray[np.floating]
-) -> npt.NDArray[np.floating]:
+def spherical_img_from_cam(image_size, rays_in_cam: np.ndarray) -> np.ndarray:
     """Project rays into a 360 panorama (spherical) image."""
     if image_size[0] != image_size[1] * 2:
         raise ValueError("Only 360° panoramas are supported.")
@@ -103,7 +93,7 @@ def spherical_img_from_cam(
 
 def get_virtual_rotations(
     num_steps_yaw: int, pitches_deg: Sequence[float]
-) -> Sequence[npt.NDArray[np.floating]]:
+) -> Sequence[np.ndarray]:
     """Get the relative rotations of the virtual cameras w.r.t. the panorama."""
     # Assuming that the panos are approximately upright.
     cams_from_pano_r = []
@@ -117,14 +107,41 @@ def get_virtual_rotations(
             cams_from_pano_r.append(cam_from_pano_r)
     return cams_from_pano_r
 
+# def get_virtual_rotations(
+#     num_steps_yaw: int,
+#     pitches_deg: Sequence[float],
+#     yaw_span_deg: float = 60.0,   # total front-facing span
+# ) -> Sequence[np.ndarray]:
+#     """Get the relative rotations of the virtual cameras w.r.t. the panorama."""
+#     cams_from_pano_r = []
+#
+#     # Front-facing yaw angles centered at 0°
+#     if num_steps_yaw == 1:
+#         yaws = np.array([0.0])
+#     else:
+#         yaws = np.linspace(
+#             -yaw_span_deg / 2,
+#             +yaw_span_deg / 2,
+#             num_steps_yaw,
+#         )
+#
+#     for pitch_deg in pitches_deg:
+#         for yaw_deg in yaws:
+#             cam_from_pano_r = Rotation.from_euler(
+#                 "XY",
+#                 [-pitch_deg, -yaw_deg],
+#                 degrees=True,
+#             ).as_matrix()
+#             cams_from_pano_r.append(cam_from_pano_r)
+#
+#     return cams_from_pano_r
+
 
 def create_pano_rig_config(
-    cams_from_pano_rotation: Sequence[npt.NDArray[np.floating]],
-    ref_idx: int = 0,
+    cams_from_pano_rotation: Sequence[np.ndarray], ref_idx: int = 0
 ) -> pycolmap.RigConfig:
     """Create a RigConfig for the given virtual rotations."""
     rig_cameras = []
-    zero_translation = cast(NDArray3x1, np.zeros((3, 1), dtype=np.float64))
     for idx, cam_from_pano_rotation in enumerate(cams_from_pano_rotation):
         if idx == ref_idx:
             cam_from_rig = None
@@ -133,8 +150,7 @@ def create_pano_rig_config(
                 cam_from_pano_rotation @ cams_from_pano_rotation[ref_idx].T
             )
             cam_from_rig = pycolmap.Rigid3d(
-                pycolmap.Rotation3d(cam_from_ref_rotation),
-                zero_translation,
+                pycolmap.Rotation3d(cam_from_ref_rotation), np.zeros(3)
             )
         rig_cameras.append(
             pycolmap.RigConfigCamera(
@@ -175,20 +191,20 @@ class PanoProcessor:
 
         # These are initialized on the first pano image
         # to avoid recomputing the rays for each pano image.
-        self._camera: pycolmap.Camera
-        self._pano_size: tuple[int, int]
-        self._rays_in_cam: npt.NDArray[np.floating]
+        self._camera = None
+        self._pano_size = None
+        self._rays_in_cam = None
 
-    def process(self, pano_name: str) -> None:
+    def process(self, pano_name: str):
         pano_path = self.pano_image_dir / pano_name
         try:
-            pano_pil_image = PIL.Image.open(pano_path)
+            pano_image = PIL.Image.open(pano_path)
         except PIL.Image.UnidentifiedImageError:
             logging.info(f"Skipping file {pano_path} as it cannot be read.")
             return
 
-        pano_exif = pano_pil_image.getexif()
-        pano_image = np.asarray(pano_pil_image)
+        pano_exif = pano_image.getexif()
+        pano_image = np.asarray(pano_image)
         gpsonly_exif = PIL.Image.Exif()
         gpsonly_exif[PIL.ExifTags.IFD.GPSInfo] = pano_exif.get_ifd(
             PIL.ExifTags.IFD.GPSInfo
@@ -223,11 +239,9 @@ class PanoProcessor:
                 self._camera.width, self._camera.height, 2
             ).astype(np.float32)
             xy_in_pano -= 0.5  # COLMAP to OpenCV pixel origin.
-            x_coords, y_coords = np.moveaxis(xy_in_pano, [0, 1, 2], [2, 1, 0])
             image = cv2.remap(
                 pano_image,
-                x_coords,
-                y_coords,
+                *np.moveaxis(xy_in_pano, [0, 1, 2], [2, 1, 0]),
                 cv2.INTER_LINEAR,
                 borderMode=cv2.BORDER_WRAP,
             )
@@ -254,7 +268,7 @@ class PanoProcessor:
 
             mask_path = self.mask_dir / mask_name
             mask_path.parent.mkdir(exist_ok=True, parents=True)
-            if not pycolmap.Bitmap.from_array(mask).write(str(mask_path)):
+            if not pycolmap.Bitmap.from_array(mask).write(mask_path):
                 raise RuntimeError(f"Cannot write {mask_path}")
 
 
@@ -285,7 +299,7 @@ def render_perspective_images(
     return processor.rig_config
 
 
-def run(args: argparse.Namespace) -> None:
+def run(args):
     pycolmap.set_random_seed(0)
 
     # Define the paths.
@@ -317,16 +331,55 @@ def run(args: argparse.Namespace) -> None:
         mask_dir,
         PANO_RENDER_OPTIONS[args.pano_render_type],
     )
+    sift_opts = pycolmap.SiftExtractionOptions(
+        max_num_features=20000,  # more features
+        peak_threshold=0.003,  # detect weaker features
+        edge_threshold=5,  # include edge features
+        estimate_affine_shape=True,  # handle distortions from wide FOV
+        domain_size_pooling=True  # improve cross-patch matches
+    )
+
+    extract_opts = pycolmap.FeatureExtractionOptions(
+        max_image_size=4096,  # upsample panorama crops
+        num_threads=-1,
+        use_gpu=True,
+        sift=sift_opts
+    )
 
     pycolmap.extract_features(
         database_path,
         image_dir,
-        reader_options=pycolmap.ImageReaderOptions(mask_path=mask_dir),
         camera_mode=pycolmap.CameraMode.PER_FOLDER,
+        extraction_options=extract_opts
     )
+
+    # pycolmap.extract_features(
+    #     database_path,
+    #     image_dir,
+    #     # reader_options={"mask_path": mask_dir},
+    #     camera_mode=pycolmap.CameraMode.PER_FOLDER,
+    #     extraction_options=sift_opts,
+    # )
 
     with pycolmap.Database.open(database_path) as db:
         pycolmap.apply_rig_config([rig_config], db)
+
+    # sift_match_opts = pycolmap.SiftMatchingOptions(
+    #     max_ratio=0.9,  # increase from 0.8 to accept weaker matches
+    #     max_distance=0.8,  # allow more distant matches
+    #     cross_check=True,  # keep consistent matches
+    #     cpu_brute_force_matcher=False
+    # )
+    #
+    # matching_options = pycolmap.FeatureMatchingOptions(
+    #     num_threads=-1,
+    #     use_gpu=True,
+    #     max_num_matches=100000,  # allow more matches for dense panoramas
+    #     guided_matching=False,
+    #     rig_verification=False,  # optional for virtual rigs
+    #     skip_image_pairs_in_same_frame=False,
+    #     sift=sift_match_opts
+    # )
 
     matching_options = pycolmap.FeatureMatchingOptions()
     # We have perfect sensor_from_rig poses (except for potential stitching
@@ -334,7 +387,7 @@ def run(args: argparse.Namespace) -> None:
     # verification using rig constraints.
     matching_options.rig_verification = True
     # The images within a frame do not have overlap due to the provided masks.
-    matching_options.skip_image_pairs_in_same_frame = True
+    matching_options.skip_image_pairs_in_same_frame = False
     if args.matcher == "sequential":
         pycolmap.match_sequential(
             database_path,
@@ -347,10 +400,10 @@ def run(args: argparse.Namespace) -> None:
         pycolmap.match_exhaustive(
             database_path, matching_options=matching_options
         )
-    elif args.matcher == "vocabtree":
-        pycolmap.match_vocabtree(
-            database_path, matching_options=matching_options
-        )
+#    elif args.matcher == "vocabtree":
+#        pycolmap.match_vocabtree(
+#            database_path, matching_options=matching_options
+#        )
     elif args.matcher == "spatial":
         pycolmap.match_spatial(database_path, matching_options=matching_options)
     else:
@@ -383,4 +436,9 @@ if __name__ == "__main__":
         default="overlapping",
         choices=list(PANO_RENDER_OPTIONS.keys()),
     )
+    output_path = parser.parse_args().output_path
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy(__file__, output_path / Path(__file__).name)
     run(parser.parse_args())
+
